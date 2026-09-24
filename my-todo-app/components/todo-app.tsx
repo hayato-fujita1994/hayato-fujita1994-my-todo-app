@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   DndContext,
   DragOverlay,
@@ -23,6 +23,7 @@ import {
   MessageCircle,
   Plus,
   Trash2,
+  Undo2,
   type LucideIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -52,6 +53,16 @@ type TodoActions = {
 };
 
 type ColumnId = "todo" | "done";
+
+// 削除してから実際にデータベースから消すまでの猶予（この間は取り消せる）
+const UNDO_DELETE_MS = 5000;
+
+// 取り消し待ちの削除。元の位置に戻せるように並び順も覚えておく
+type PendingDelete = {
+  todo: Todo;
+  index: number;
+  timer: ReturnType<typeof setTimeout>;
+};
 
 const COLUMNS: {
   id: ColumnId;
@@ -111,6 +122,11 @@ export function TodoApp({ userName }: { userName: string }) {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(
+    null,
+  );
+  // タイマーやアンマウント時の処理からも最新の値を読めるように ref にも持つ
+  const pendingDeleteRef = useRef<PendingDelete | null>(null);
 
   // マウスは少し動かしてからドラッグ開始（クリック操作と区別）、
   // タッチは長押しでドラッグ開始（スクロールと区別）
@@ -132,7 +148,13 @@ export function TodoApp({ userName }: { userName: string }) {
     if (error) {
       setError("タスクを読み込めませんでした。ページを再読み込みしてください");
     } else {
-      setTodos((data as unknown as TodoRow[]).map(toTodo));
+      // 取り消し待ちのタスクは、まだデータベースに残っていても表示しない
+      const pendingId = pendingDeleteRef.current?.todo.id;
+      setTodos(
+        (data as unknown as TodoRow[])
+          .map(toTodo)
+          .filter((todo) => todo.id !== pendingId),
+      );
     }
     setLoaded(true);
   }, []);
@@ -185,14 +207,71 @@ export function TodoApp({ userName }: { userName: string }) {
   };
 
   // コメントもデータベース側で一緒に削除される（on delete cascade）
-  const deleteTodo = (id: string) => {
-    setTodos((prev) => prev.filter((todo) => todo.id !== id));
-    setError(null);
+  const commitDelete = (id: string) => {
     save(
       createClient().from("todos").delete().eq("id", id),
       "タスクを削除できませんでした",
     );
   };
+
+  // 取り消し待ちの削除があれば、待たずにデータベースから削除する
+  const flushPendingDelete = () => {
+    const pending = pendingDeleteRef.current;
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pendingDeleteRef.current = null;
+    setPendingDelete(null);
+    commitDelete(pending.todo.id);
+  };
+
+  // 画面からはすぐ消し、データベースからは猶予が過ぎてから削除する
+  const deleteTodo = (id: string) => {
+    const index = todos.findIndex((todo) => todo.id === id);
+    if (index === -1) return;
+    flushPendingDelete();
+    const pending: PendingDelete = {
+      todo: todos[index],
+      index,
+      timer: setTimeout(() => {
+        pendingDeleteRef.current = null;
+        setPendingDelete(null);
+        commitDelete(id);
+      }, UNDO_DELETE_MS),
+    };
+    pendingDeleteRef.current = pending;
+    setPendingDelete(pending);
+    setTodos((prev) => prev.filter((todo) => todo.id !== id));
+    setError(null);
+  };
+
+  const undoDelete = () => {
+    const pending = pendingDeleteRef.current;
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pendingDeleteRef.current = null;
+    setPendingDelete(null);
+    setTodos((prev) => {
+      const next = [...prev];
+      next.splice(Math.min(pending.index, next.length), 0, pending.todo);
+      return next;
+    });
+  };
+
+  // ログアウトなどで画面が切り替わるときは、取り消し待ちの削除を確定させる
+  useEffect(() => {
+    return () => {
+      const pending = pendingDeleteRef.current;
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingDeleteRef.current = null;
+      // then を呼ばないとリクエストが送られない
+      createClient()
+        .from("todos")
+        .delete()
+        .eq("id", pending.todo.id)
+        .then(() => {});
+    };
+  }, []);
 
   const addComment = (todoId: string, text: string) => {
     const comment: Comment = {
@@ -341,6 +420,27 @@ export function TodoApp({ userName }: { userName: string }) {
             {activeTodo ? <TodoCard todo={activeTodo} overlay /> : null}
           </DragOverlay>
         </DndContext>
+      )}
+
+      {pendingDelete && (
+        <div
+          role="status"
+          className="fixed inset-x-4 bottom-6 z-30 mx-auto flex max-w-md items-center gap-3 rounded-2xl border border-border/60 bg-card/95 py-2.5 pl-4 pr-2 shadow-2xl shadow-violet-500/10 backdrop-blur-xl animate-in fade-in-0 slide-in-from-bottom-2 duration-200"
+        >
+          <p className="min-w-0 flex-1 truncate text-sm">
+            「{pendingDelete.todo.text}」を削除しました
+          </p>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={undoDelete}
+            className="shrink-0 rounded-xl font-semibold text-primary"
+          >
+            <Undo2 />
+            元に戻す
+          </Button>
+        </div>
       )}
     </div>
   );
